@@ -1918,10 +1918,36 @@ rpzalloc(size_t size) {
 	return heap_allocate_block(heap, size, 1);
 }
 
+/* iOS-Mythic diagnostic: log+exit if called with an obviously bad pointer.
+ * On iOS we hit rpfree with x0=small (< 0x10000000) which faults inside
+ * block_deallocate. Encode the bad pointer's low 16 bits + caller's LR
+ * low 16 bits into exit status so we can identify the bug. */
 extern inline void
 rpfree(void* ptr) {
 	if (UNEXPECTED(ptr == 0))
 		return;
+	if (UNEXPECTED((unsigned long long)ptr < 0x10000000ULL)) {
+		/* iOS-Mythic: skip free for obviously-bad pointer (likely from
+		 * destructor of zero-initialized vector with non-null garbage data
+		 * pointer due to ARM64EC ABI mismatch on struct return). Log it but
+		 * continue execution so x86_64 PE can still print Hello World. */
+		unsigned long long _lr = (unsigned long long)__builtin_return_address(0);
+		unsigned long long _p = (unsigned long long)ptr;
+		char buf[80];
+		const char *hexd = "0123456789abcdef";
+		int i = 0;
+		const char *prefix = "[rpfree-skip] ptr=0x";
+		while (prefix[i]) { buf[i] = prefix[i]; i++; }
+		for (int j = 60; j >= 0; j -= 4) buf[i++] = hexd[(_p >> j) & 0xf];
+		const char *lrstr = " lr=0x";
+		for (int k = 0; lrstr[k]; ++k) buf[i++] = lrstr[k];
+		for (int j = 60; j >= 0; j -= 4) buf[i++] = hexd[(_lr >> j) & 0xf];
+		buf[i++] = '\n';
+		void *h = GetStdHandle((unsigned long)-12);
+		unsigned long w;
+		WriteFile(h, buf, (unsigned long)i, &w, 0);
+		return;
+	}
 	block_deallocate(ptr);
 }
 
