@@ -185,7 +185,23 @@ madvise(caddr_t, size_t, int);
 #define LARGE_PAGE_SIZE (1 << LARGE_PAGE_SIZE_SHIFT)
 #define LARGE_PAGE_MASK (~((uintptr_t)LARGE_PAGE_SIZE - 1))
 
+#ifdef FEX_IOS_HOST
+/* iOS-Mythic ml332: 256MB spans are unaffordable in a 39-bit shared address space.
+ *
+ * os_mmap reserves size+alignment, so every span costs 512MB of VA, and rpmalloc's
+ * per-thread heaps map one span per page type -- ml330 measured 69 spans / 35GB
+ * reserved (~1% committed) inside the same 64GB window that CEF's PartitionAlloc
+ * needs, until FEXCore CreateThread's aligned_alloc returned NULL (#43). Releasing
+ * dead threads' spans is NOT the fix: the heap is shared across threads, and doing
+ * so corrupted live containers (#54, ml329/ml331).
+ *
+ * 64MB is the floor (SPAN_SIZE / LARGE_PAGE_SIZE must be >= 1; LARGE_PAGE_SIZE_SHIFT
+ * is 26) and cuts per-span VA 4x to 128MB. SPAN_MASK derives, span lookup arithmetic
+ * is unchanged. */
+#define SPAN_SIZE (64 * 1024 * 1024)
+#else
 #define SPAN_SIZE (256 * 1024 * 1024)
+#endif
 #define SPAN_MASK (~((uintptr_t)(SPAN_SIZE - 1)))
 
 ////////////
