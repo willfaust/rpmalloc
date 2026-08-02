@@ -801,8 +801,59 @@ os_mmap(size_t size, size_t alignment, size_t* offset, size_t* mapped_size) {
 #else
 	DWORD do_commit = MEM_COMMIT;
 #endif
-	void* ptr =
-	    VirtualAlloc(0, map_size, (os_huge_pages ? MEM_LARGE_PAGES : 0) | MEM_RESERVE | do_commit, PAGE_READWRITE);
+	void* ptr = 0;
+#ifdef FEX_IOS_HOST
+	/* iOS-Mythic ml415 (#60/#62): size+alignment doubles every span to 128MB of
+	 * reserved VA, and per-thread heaps map one span per page type — with a
+	 * 100+ thread webhelper this alone exhausts the 16GB FEX band, at which
+	 * point span maps return NULL and allocation livelocks inside
+	 * heap_get_page_generic/page_put_thread_free_block DURING CompileCode,
+	 * with CodeInvalidationMutex held shared — the ml413/ml414/ml415 wedge.
+	 * Wine's NtAllocateVirtualMemoryEx honors MemExtendedParameterAddress-
+	 * Requirements (the iOS va-scan is alignment-aware), so ask for an exact
+	 * aligned reservation first: a 64MB span then costs 64MB. Fall through to
+	 * the legacy over-reserve on any failure. */
+	if (alignment) {
+		typedef PVOID(WINAPI* VirtualAlloc2_t)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, MEM_EXTENDED_PARAMETER*, ULONG);
+		static VirtualAlloc2_t pVirtualAlloc2 = (VirtualAlloc2_t)(uintptr_t)-1;
+		if (pVirtualAlloc2 == (VirtualAlloc2_t)(uintptr_t)-1) {
+			HMODULE kb = GetModuleHandleW(L"kernelbase.dll");
+			pVirtualAlloc2 = kb ? (VirtualAlloc2_t)(void*)GetProcAddress(kb, "VirtualAlloc2") : 0;
+		}
+		if (pVirtualAlloc2) {
+			MEM_ADDRESS_REQUIREMENTS req;
+			MEM_EXTENDED_PARAMETER param;
+			memset(&req, 0, sizeof(req));
+			memset(&param, 0, sizeof(param));
+			req.Alignment = alignment;
+			/* iOS-Mythic ml420 (#69/#62): without an address range the spans
+			 * land wherever wine finds aligned VA — ml419 shows heaps in the
+			 * GUEST band (0x703d860000, 0x70873f0000), violating the VA map
+			 * (guest <= 0x73ffff0000 | PA [0x74,0x7c) | FEX host [0x7c,0x80)).
+			 * rpmalloc spans are FEX host structures — pin them to the FEX
+			 * band. If the band is full, retry unconstrained (pollution over
+			 * livelock), then the legacy over-reserve. */
+			req.LowestStartingAddress = (PVOID)0x7c00000000ULL;
+			req.HighestEndingAddress = (PVOID)0x7fffffffffULL;
+			param.Type = MemExtendedParameterAddressRequirements;
+			param.Pointer = &req;
+			ptr = pVirtualAlloc2(GetCurrentProcess(), 0, size,
+			                     (os_huge_pages ? MEM_LARGE_PAGES : 0) | MEM_RESERVE | do_commit,
+			                     PAGE_READWRITE, &param, 1);
+			if (!ptr) {
+				req.LowestStartingAddress = 0;
+				req.HighestEndingAddress = 0;
+				ptr = pVirtualAlloc2(GetCurrentProcess(), 0, size,
+				                     (os_huge_pages ? MEM_LARGE_PAGES : 0) | MEM_RESERVE | do_commit,
+				                     PAGE_READWRITE, &param, 1);
+			}
+			if (ptr)
+				map_size = size;
+		}
+	}
+#endif
+	if (!ptr)
+		ptr = VirtualAlloc(0, map_size, (os_huge_pages ? MEM_LARGE_PAGES : 0) | MEM_RESERVE | do_commit, PAGE_READWRITE);
 #else
 	int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_UNINITIALIZED;
 #if defined(__APPLE__) && !TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
@@ -1609,6 +1660,30 @@ heap_get_page_generic(heap_t* heap, uint32_t size_class) {
 			wait_spin();
 		}
 		block_t* block = (void*)block_mt;
+#ifdef FEX_IOS_HOST
+		/* iOS-Mythic ml416 (#60): if heap->owner_thread != this thread's TEB,
+		 * every block_deallocate below classifies the block as remote
+		 * (page_is_thread_heap fails) and page_put_thread_free_block pushes it
+		 * straight back onto the list being drained — the drain never
+		 * converges. Sampled live twice (ml415 shared-hold, ml416 write-hold):
+		 * the thread spins at this walk forever with CodeInvalidationMutex
+		 * held and the whole process wedges behind it. This drain is only
+		 * reached from the draining thread's own allocation path, so
+		 * ownership here is by-construction this thread's: repair the stamp
+		 * (which makes the frees local and the walk converge) and leave the
+		 * old owner in TEB Instrumentation[4]/heap in [5] for the unix-side
+		 * census to report. */
+		{
+			uintptr_t self_teb = get_thread_id();
+			if (heap->owner_thread != self_teb) {
+				if (self_teb > 0x10000 && !(self_teb & 0xfff)) {
+					((void**)self_teb)[0x16d8 / 8] = (void*)heap->owner_thread;
+					((void**)self_teb)[0x16e0 / 8] = (void*)heap;
+				}
+				heap->owner_thread = self_teb;
+			}
+		}
+#endif
 		while (block) {
 			block_t* next_block = block->next;
 			block_deallocate(block);
