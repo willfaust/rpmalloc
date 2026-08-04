@@ -1175,13 +1175,45 @@ ios_block_ptr_ok(void* p) {
 	return ((uintptr_t)p - 0x7c00000000ULL) < 0x400000000ULL;
 }
 
+/* iOS-Mythic ml490 (corrupter hunt): route poison notes to a FILE.
+ *
+ * These have always gone to GetStdHandle(STD_ERROR), which for steamwebhelper
+ * is its CONSOLE WINDOW — invisible in mythic-log. That is why every #76/#88
+ * diagnostic since ml466 has been silently discarded: 0 hits across six runs,
+ * including two that crashed ONE INSTRUCTION after this call. Writing to
+ * C:\rpm-poison.log (pullable via devicectl) turns them on for the first time.
+ *
+ * Why this matters now: the bytes that overwrite rpmalloc's free-list pointer
+ * decode as ASCII — 0xa316531373030 is "0071e1\n", the tail of a hex address
+ * plus a newline, i.e. FORMATTED LOG TEXT. Something writes log output into a
+ * block it does not own. The note already dumps the holder block's leading
+ * qwords; rendering them as ASCII should show enough of the string to identify
+ * the writer by its format. */
+static void*
+ios_rpm_emit_handle(void) {
+	static void* h;
+	if (!h)
+		h = CreateFileA("C:\\rpm-poison.log", 4 /*FILE_APPEND_DATA*/, 1 | 2 /*share rw*/, 0,
+		                4 /*OPEN_ALWAYS*/, 0x80 /*NORMAL*/, 0);
+	return (h == (void*)(uintptr_t)-1) ? 0 : h;
+}
+
+static void
+ios_rpm_emit(const char* buf, int len) {
+	unsigned long w;
+	void* h = ios_rpm_emit_handle();
+	if (h)
+		WriteFile(h, buf, (unsigned long)len, &w, 0);
+	WriteFile(GetStdHandle((unsigned long)-12), buf, (unsigned long)len, &w, 0);
+}
+
 static void
 ios_rpm_poison_note(const char* tag, void* owner, void* bad, void* holder) {
 	static _Atomic(int) poison_logs;
 	if (atomic_fetch_add_explicit(&poison_logs, 1, memory_order_relaxed) >= 32)
 		return;
 	/* No printf in this TU (see [rpfree-skip]) — hand-format. */
-	char buf[352];
+	char buf[640];
 	const char* hexd = "0123456789abcdef";
 	int i = 0, j;
 	unsigned long w;
@@ -1214,9 +1246,29 @@ ios_rpm_poison_note(const char* tag, void* owner, void* bad, void* holder) {
 			buf[i++] = ' '; buf[i++] = 'q'; buf[i++] = hexd[k]; buf[i++] = '=';
 			for (j = 60; j >= 0; j -= 4) buf[i++] = hexd[(v >> j) & 0xf];
 		}
+		/* ml490: render the same bytes as ASCII — the payload is log text, and
+		 * the format string it came from names the writer. */
+		{
+			const unsigned char* c = (const unsigned char*)holder;
+			const char* s = " ascii=\"";
+			for (j = 0; s[j]; ++j) buf[i++] = s[j];
+			for (k = 0; k < 48; ++k)
+				buf[i++] = (c[k] >= 32 && c[k] < 127) ? (char)c[k] : '.';
+			buf[i++] = '"';
+		}
 	}
-	buf[i++] = ' '; buf[i++] = 'm'; buf[i++] = 'l'; buf[i++] = '4'; buf[i++] = '6'; buf[i++] = '6'; buf[i++] = '\n';
-	WriteFile(GetStdHandle((unsigned long)-12), buf, (unsigned long)i, &w, 0);
+	/* ml490: also dump the raw BAD value as ASCII — for heap-head/page-head the
+	 * poisoned slot IS the payload and there is no holder block to dump. */
+	{
+		const unsigned char* c = (const unsigned char*)&bad;
+		const char* s = " badascii=\"";
+		for (j = 0; s[j]; ++j) buf[i++] = s[j];
+		for (j = 0; j < 8; ++j)
+			buf[i++] = (c[j] >= 32 && c[j] < 127) ? (char)c[j] : '.';
+		buf[i++] = '"';
+	}
+	buf[i++] = ' '; buf[i++] = 'm'; buf[i++] = 'l'; buf[i++] = '4'; buf[i++] = '9'; buf[i++] = '0'; buf[i++] = '\n';
+	ios_rpm_emit(buf, i);
 }
 #endif
 
@@ -2431,6 +2483,23 @@ rpmalloc_initialize(rpmalloc_interface_t* memory_interface) {
 	}
 
 	global_rpmalloc_initialized = 1;
+
+#ifdef FEX_IOS_HOST
+	/* ml492: prove the sink. C:\rpm-poison.log is created lazily on the first
+	 * poison note, so an ABSENT file was ambiguous — guard never fired, or the
+	 * write is broken? One banner at init disambiguates: file MISSING => sink
+	 * broken; banner ONLY => genuinely clean run; banner + [rpm-poison] =>
+	 * payload captured.
+	 * ml491 put this in rpmalloc_initialize_config(), which iOS never calls —
+	 * Source/Windows/Common/CRT/CRT_iOS.cpp calls rpmalloc_initialize(nullptr)
+	 * directly, so the banner never ran and the file stayed missing, which read
+	 * as "sink broken" when it was really "banner in the wrong function".
+	 * This is the common path: _config() delegates here too. */
+	{
+		static const char banner[] = "[rpm-sink] alive rev=ml492\n";
+		ios_rpm_emit(banner, (int)(sizeof(banner) - 1));
+	}
+#endif
 
 	global_memory_interface = memory_interface ? memory_interface : &global_memory_interface_default;
 	if (!global_memory_interface->memory_map || !global_memory_interface->memory_unmap) {
