@@ -1229,11 +1229,21 @@ page_block_realign(page_t* page, block_t* block) {
 
 static block_t*
 page_get_local_free_block(page_t* page) {
+#ifdef FEX_IOS_HOST
+	/* ml484 (#88): same omission as heap_pop_local_free — the block was checked
+	 * but `page` itself never was, and every branch below both reads and writes
+	 * through it. Validate the owner first. */
+	if (UNEXPECTED(!ios_block_ptr_ok(page))) {
+		ios_rpm_poison_note("page-base", page, page, 0);
+		return 0;
+	}
+#endif
 	block_t* block = page->local_free;
 #ifdef FEX_IOS_HOST
 	/* ml466 (#76): poisoned head — drop the whole chain, report empty. */
 	if (UNEXPECTED(!ios_block_ptr_ok(block))) {
 		ios_rpm_poison_note("page-head", page, block, 0);
+		if (UNEXPECTED(!ios_block_ptr_ok(page))) return 0;   /* ml485 — see heap_pop_local_free */
 		page->local_free = 0;
 		page->local_free_count = 0;
 		return 0;
@@ -1244,8 +1254,10 @@ page_get_local_free_block(page_t* page) {
 		if (UNEXPECTED(next && !ios_block_ptr_ok(next))) {
 			ios_rpm_poison_note("page-next", page, next, block);
 			next = 0;
+			if (UNEXPECTED(!ios_block_ptr_ok(page))) return 0;   /* ml485 */
 			page->local_free_count = 1;
 		}
+		if (UNEXPECTED(!ios_block_ptr_ok(page))) return 0;       /* ml485 */
 		page->local_free = next;
 	}
 #else
@@ -1919,6 +1931,21 @@ heap_get_page(heap_t* heap, uint32_t size_class) {
 static inline RPMALLOC_ALLOCATOR void*
 heap_pop_local_free(heap_t* heap, uint32_t size_class) {
 	block_t** free_list = heap->local_free + size_class;
+#ifdef FEX_IOS_HOST
+	/* ml484 (#88): ml466's guard validated the BLOCK but then read and wrote
+	 * through `heap->local_free[size_class]` — an address derived from an
+	 * UNVALIDATED heap. ml483 died exactly there: `str xzr, [x21, x20, lsl #3]`
+	 * (heap_allocate_block_aligned+…, right after ios_rpm_poison_note) faulted
+	 * writing to 0x5183a58a7a8188 — a wild address far outside the 39-bit VA,
+	 * i.e. the HEAP pointer itself was garbage, not just the block. 65 repeats,
+	 * then the webhelper died c0000005 with the login window already up.
+	 * Validate the owner before touching it; a bad heap means this thread's
+	 * cache is unusable, so report empty and let the caller map fresh. */
+	if (UNEXPECTED(!ios_block_ptr_ok(free_list))) {
+		ios_rpm_poison_note("heap-base", heap, free_list, 0);
+		return 0;
+	}
+#endif
 	block_t* block = *free_list;
 #ifdef FEX_IOS_HOST
 	/* ml466 (#76): all four crashes were THIS pop dereferencing a poisoned
@@ -1926,7 +1953,18 @@ heap_pop_local_free(heap_t* heap, uint32_t size_class) {
 	if (EXPECTED(block != 0)) {
 		if (UNEXPECTED(!ios_block_ptr_ok(block))) {
 			ios_rpm_poison_note("heap-head", heap, block, 0);
-			*free_list = 0;
+			/* ml485 (#88): re-derive and re-validate the destination AFTER the
+			 * call, with nothing between the check and the store. ml484 added
+			 * an entry check and ml484's run STILL died one instruction after
+			 * ios_rpm_poison_note — `str xzr, [x20]` in the heap-next branch,
+			 * writing to 0xa316531373030 (ASCII "\n1e1700"). local_free is an
+			 * ARRAY, so free_list is pure arithmetic on `heap`; a wild
+			 * destination therefore means the compiler rematerialised it from a
+			 * spilled/reloaded `heap` that the corrupter had scribbled while we
+			 * were inside the note. An entry-only check cannot cover that. */
+			block_t** dst = heap->local_free + size_class;
+			if (UNEXPECTED(!ios_block_ptr_ok(dst))) return 0;
+			*dst = 0;
 			return 0;
 		}
 		block_t* next = block->next;
@@ -1934,7 +1972,11 @@ heap_pop_local_free(heap_t* heap, uint32_t size_class) {
 			ios_rpm_poison_note("heap-next", heap, next, block);
 			next = 0;
 		}
-		*free_list = next;
+		{
+			block_t** dst = heap->local_free + size_class;   /* ml485 — see above */
+			if (UNEXPECTED(!ios_block_ptr_ok(dst))) return 0;
+			*dst = next;
+		}
 	}
 #else
 	if (EXPECTED(block != 0))
