@@ -828,6 +828,139 @@ os_set_page_name(void* address, size_t size) {
 #endif
 }
 
+#ifdef FEX_IOS_HOST
+/* iOS-Mythic ml706: ONE VA-layout profile, selected before rpmalloc's FIRST
+ * mapping and published to every other consumer.
+ *
+ * The FEX host band was a compile-time constant in FOUR places: os_mmap below,
+ * ios_block_ptr_ok, FEXCore::Allocator::VirtualAlloc and CallRetStack. On iOS
+ * 26.x the usable VA ceiling is 64GB rather than 512GB, so [0x7c,0x80) sits
+ * entirely above it and wine rejects the request during PARAMETER VALIDATION
+ * (limit_low >= user_space_limit) without attempting a single placement -- it
+ * is not an mmap refusal, nothing is ever mapped. Each site then retried
+ * UNCONSTRAINED, and rpmalloc -- which runs before arm64ec_process_init,
+ * before SetupHooks and before FEX logging exists -- placed its spans and heap
+ * metadata in the GUEST band (0x158920000, 0x159000000; wine's own
+ * [commit-zero] labels them GUEST). Metadata was corrupted almost immediately,
+ * ThreadState never materialised, x28 stayed 0, and every x86-64 process died
+ * before its first guest instruction. Native ARM64 was unaffected because it
+ * never needs this arena, which made it look device-specific.
+ *
+ * Selected HERE because this is the earliest allocator in the process, and
+ * reported through a bare WriteFile because it is the only output channel
+ * alive this early: VirtualName is a no-op until SetupHooks, and FEX's
+ * LogManager does not exist yet. Deliberately does NOT use ios_rpm_emit --
+ * that opens a file, and CreateFileA can allocate, which would re-enter
+ * rpmalloc during its own initialisation. */
+uintptr_t ios_fex_band_base = 0;
+uintptr_t ios_fex_band_end = 0;
+
+typedef PVOID(WINAPI* ios_valloc2_t)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, MEM_EXTENDED_PARAMETER*, ULONG);
+
+static void
+ios_va_emit(const char* buf, int len) {
+	unsigned long w;
+	WriteFile(GetStdHandle((unsigned long)-12), buf, (unsigned long)len, &w, 0);
+}
+
+static int
+ios_va_cat(char* buf, int i, const char* s) {
+	while (*s)
+		buf[i++] = *s++;
+	return i;
+}
+
+static int
+ios_va_hex(char* buf, int i, uintptr_t v) {
+	const char* hexd = "0123456789abcdef";
+	int shift = 60, started = 0;
+	buf[i++] = '0';
+	buf[i++] = 'x';
+	for (; shift >= 0; shift -= 4) {
+		int d = (int)((v >> shift) & 0xf);
+		if (d || started || !shift) {
+			buf[i++] = hexd[d];
+			started = 1;
+		}
+	}
+	return i;
+}
+
+static void
+ios_fex_band_select(ios_valloc2_t valloc2) {
+	static const uintptr_t cand[][2] = {
+		/* 512GB regime (iOS 27): the established layout. Must stay clear of
+		 * CEF's four 16GB PartitionAlloc pools at [0x74,0x7c) -- see the ml325
+		 * correction in AllocatorHooks.h. */
+		{0x7c00000000ULL, 0x7fffffffffULL},
+		/* Constrained 64GB regime (iOS 26.x): a host-only slice at 48-56GB,
+		 * inside the low free hole and below the GPU carveout at [64G,448G).
+		 * Sized for simple guests; CEF's pools need separate placement work. */
+		{0x0c00000000ULL, 0x0dffffffffULL},
+	};
+	SYSTEM_INFO si;
+	char buf[224];
+	int i, c;
+
+	memset(&si, 0, sizeof(si));
+	GetSystemInfo(&si);
+	i = ios_va_cat(buf, 0, "[va-profile] ml706 maxapp=");
+	i = ios_va_hex(buf, i, (uintptr_t)si.lpMaximumApplicationAddress);
+	i = ios_va_cat(buf, i, "\n");
+	ios_va_emit(buf, i);
+
+	for (c = 0; c < (int)(sizeof(cand) / sizeof(cand[0])); ++c) {
+		MEM_ADDRESS_REQUIREMENTS req;
+		MEM_EXTENDED_PARAMETER param;
+		void* probe;
+
+		memset(&req, 0, sizeof(req));
+		memset(&param, 0, sizeof(param));
+		req.Alignment = 0x10000;
+		req.LowestStartingAddress = (PVOID)cand[c][0];
+		req.HighestEndingAddress = (PVOID)cand[c][1];
+		param.Type = MemExtendedParameterAddressRequirements;
+		param.Pointer = &req;
+		/* A real placement attempt. Mappability is never inferred from a VM gap
+		 * walk: on 26.x the walk reports [0x70,0x80) as 65536 MB FREE with all
+		 * four slots CLEAR while the kernel refuses every mapping in it. */
+		probe = valloc2(GetCurrentProcess(), 0, 0x10000, MEM_RESERVE, PAGE_NOACCESS, &param, 1);
+
+		i = ios_va_cat(buf, 0, "[va-profile] ml706 cand");
+		buf[i++] = (char)('0' + c);
+		i = ios_va_cat(buf, i, " base=");
+		i = ios_va_hex(buf, i, cand[c][0]);
+		if (probe) {
+			i = ios_va_cat(buf, i, " PROBE-OK got=");
+			i = ios_va_hex(buf, i, (uintptr_t)probe);
+		} else {
+			i = ios_va_cat(buf, i, " PROBE-FAIL");
+		}
+		i = ios_va_cat(buf, i, "\n");
+		ios_va_emit(buf, i);
+
+		if (probe) {
+			VirtualFree(probe, 0, MEM_RELEASE);
+			ios_fex_band_base = cand[c][0];
+			ios_fex_band_end = cand[c][1];
+			break;
+		}
+	}
+
+	if (ios_fex_band_base) {
+		i = ios_va_cat(buf, 0, "[va-profile] ml706 SELECTED base=");
+		i = ios_va_hex(buf, i, ios_fex_band_base);
+		i = ios_va_cat(buf, i, " end=");
+		i = ios_va_hex(buf, i, ios_fex_band_end);
+		i = ios_va_cat(buf, i, "\n");
+	} else {
+		i = ios_va_cat(buf, 0,
+		               "[va-profile] ml706 NO BAND -- FEX host allocations fail instead of entering guest space\n");
+	}
+	ios_va_emit(buf, i);
+}
+#endif
+
 static void*
 os_mmap(size_t size, size_t alignment, size_t* offset, size_t* mapped_size) {
 	size_t map_size = size + alignment;
@@ -886,27 +1019,48 @@ os_mmap(size_t size, size_t alignment, size_t* offset, size_t* mapped_size) {
 			 * rpmalloc spans are FEX host structures — pin them to the FEX
 			 * band. If the band is full, retry unconstrained (pollution over
 			 * livelock), then the legacy over-reserve. */
-			req.LowestStartingAddress = (PVOID)0x7c00000000ULL;
-			req.HighestEndingAddress = (PVOID)0x7fffffffffULL;
-			param.Type = MemExtendedParameterAddressRequirements;
-			param.Pointer = &req;
-			ptr = pVirtualAlloc2(GetCurrentProcess(), 0, size,
-			                     (os_huge_pages ? MEM_LARGE_PAGES : 0) | MEM_RESERVE | do_commit,
-			                     PAGE_READWRITE, &param, 1);
-			if (!ptr) {
-				req.LowestStartingAddress = 0;
-				req.HighestEndingAddress = 0;
+			/* ml706: the band is chosen at runtime, on the first mapping. */
+			if (!ios_fex_band_base)
+				ios_fex_band_select(pVirtualAlloc2);
+			if (ios_fex_band_base) {
+				req.LowestStartingAddress = (PVOID)ios_fex_band_base;
+				req.HighestEndingAddress = (PVOID)ios_fex_band_end;
+				param.Type = MemExtendedParameterAddressRequirements;
+				param.Pointer = &req;
 				ptr = pVirtualAlloc2(GetCurrentProcess(), 0, size,
 				                     (os_huge_pages ? MEM_LARGE_PAGES : 0) | MEM_RESERVE | do_commit,
 				                     PAGE_READWRITE, &param, 1);
 			}
+			/* ml706: NO unconstrained retry. Clearing the bounds and re-issuing
+			 * is exactly how rpmalloc's spans and heap metadata ended up in
+			 * guest-writable memory on a constrained device, which corrupted
+			 * the heap before FEX had a ThreadState. A failure here stays a
+			 * failure; see the emit below. */
 			if (ptr)
 				map_size = size;
 		}
 	}
 #endif
+#ifdef FEX_IOS_HOST
+	/* ml706: the legacy over-reserve is unconstrained too, so it is the same
+	 * hazard by another name. Report and leave ptr NULL rather than hand
+	 * rpmalloc guest-writable memory. */
+	if (!ptr) {
+		static _Atomic(int) band_fail_logs;
+		if (atomic_fetch_add_explicit(&band_fail_logs, 1, memory_order_relaxed) < 8) {
+			char b[160];
+			int n = ios_va_cat(b, 0, "[va-profile] ml706 HOST MAP FAILED size=");
+			n = ios_va_hex(b, n, (uintptr_t)size);
+			n = ios_va_cat(b, n, " band=");
+			n = ios_va_hex(b, n, ios_fex_band_base);
+			n = ios_va_cat(b, n, " (no unconstrained fallback by design)\n");
+			ios_va_emit(b, n);
+		}
+	}
+#else
 	if (!ptr)
 		ptr = VirtualAlloc(0, map_size, (os_huge_pages ? MEM_LARGE_PAGES : 0) | MEM_RESERVE | do_commit, PAGE_READWRITE);
+#endif
 #ifdef FEX_IOS_HOST
 	/* ml465 (#76): verdict line. Anything rpmalloc owns that lands BELOW the
 	 * FEX band is guest-writable and can be scribbled (that is exactly how the
@@ -916,7 +1070,7 @@ os_mmap(size_t size, size_t alignment, size_t* offset, size_t* mapped_size) {
 	 * FEX-band heap was poisoned anyway — the guest-band framing above is
 	 * REFUTED as the root cause. Keep the pin as VA-map hygiene; the corrupter
 	 * is pointer-mediated (see ios_block_ptr_ok / [rpm-poison]). */
-	if (ptr && (uintptr_t)ptr < 0x7c00000000ULL) {
+	if (ptr && ios_fex_band_base && (uintptr_t)ptr < ios_fex_band_base) {
 		static _Atomic(int) band_logs;
 		if (atomic_fetch_add_explicit(&band_logs, 1, memory_order_relaxed) < 24) {
 			/* No printf in this TU (see [rpfree-skip] below) — hand-format. */
@@ -1194,7 +1348,11 @@ page_block_to_thread_free_list(page_t* page, uint32_t block_index, uint32_t list
  * object type. A clean run prints no [rpm-poison] lines. */
 static inline int
 ios_block_ptr_ok(void* p) {
-	return ((uintptr_t)p - 0x7c00000000ULL) < 0x400000000ULL;
+	/* ml706: follows the selected band. Before selection nothing can be
+	 * classified, so do not amputate chains on a guess. */
+	if (!ios_fex_band_base)
+		return 1;
+	return ((uintptr_t)p - ios_fex_band_base) <= (ios_fex_band_end - ios_fex_band_base);
 }
 
 /* iOS-Mythic ml490 (corrupter hunt): route poison notes to a FILE.
