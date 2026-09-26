@@ -1819,7 +1819,20 @@ rpm_avail_check(heap_t* heap, size_t size_class, page_t* page, int is_head, cons
 			 *
 			 * `is_head` means "the caller promises this IS the head", never "a NULL
 			 * prev is legitimate here". The real condition is positional, so
-			 * compute the position. */
+			 * compute the position.
+			 *
+			 * ml623: "head must have no prev" was NOT an invariant of this
+			 * allocator until ml623 made it one. bad=0x20 with intact
+			 * reciprocity (p.prev->next == page) was the allocator's own doing:
+			 * the head-removal branches published `page_available[sc] = page->next`
+			 * WITHOUT clearing the new head's prev, and page_full_to_available()
+			 * re-published a page as head keeping the prev from its previous stint.
+			 * Upstream never reads head->prev, so it was benign there — but here it
+			 * drove page_available_to_free() into the "corrupt" branch on a healthy
+			 * list, which then zeroed the whole head slot and orphaned the rest of
+			 * the list (the ml614 shape). Both producers now clear prev, so the two
+			 * positional bits below are real invariants and a hit is real
+			 * corruption, not bookkeeping slack. */
 			page_t* head = (size_class < SIZE_CLASS_COUNT) ? heap->page_available[size_class] : 0;
 			if (head == page) {
 				if (page->prev)
@@ -1914,22 +1927,58 @@ page_available_to_free(page_t* page) {
 	 * That leaks one page. A leaked page is unambiguously better than a wild
 	 * write through a corrupt link, and the [rpm-avail] dump above has already
 	 * recorded the state for diagnosis. */
-	unsigned bad = rpm_avail_check(page->heap, page->size_class, page, /*is_head=*/0, "to_free");
-	rpmalloc_assert(page->is_full == 0, "Page full flag internal failure");
+	/* ml623: a FULL page is not on the available list at all — page_available_to_full()
+	 * unlinked it and cleared both links — so page_available[]'s invariants do not
+	 * apply to it and there is nothing to unlink. This is reachable: a full page can
+	 * have block_used dropped below block_count by page_adopt_thread_free_block_list()
+	 * and then reach 0 on the next local free. The old code ran the trap (which would
+	 * now report the harmless prev==0/not-head shape) and, before ml615, executed
+	 * `page->prev->next = …` through the page's STALE prev — a wild write into a page
+	 * that may already have been reused. Handle it explicitly instead. */
+	unsigned bad = 0;
+	if (UNEXPECTED(page->is_full != 0)) {
+		page->is_full = 0;
+		page->prev = 0;
+		page->is_free = 1;
+		page->is_zero = 0;
+		heap_t* full_heap = page->heap;
+		page->next = full_heap->page_free[page->page_type];
+		full_heap->page_free[page->page_type] = page;
+		if (++full_heap->page_free_commit_count[page->page_type] >= global_page_free_overflow[page->page_type])
+			heap_page_free_decommit(full_heap, page->page_type, global_page_free_retain[page->page_type]);
+		return;
+	}
+	bad = rpm_avail_check(page->heap, page->size_class, page, /*is_head=*/0, "to_free");
 	rpmalloc_assert(page->is_decommitted == 0, "Page decommitted flag internal failure");
 	heap_t* heap = page->heap;
 	if (bad) {
 		/* Only detach the head if this page genuinely is it; otherwise leave the
-		 * list alone entirely rather than trust either link. */
-		if (page->size_class < SIZE_CLASS_COUNT && heap->page_available[page->size_class] == page)
-			heap->page_available[page->size_class] = 0;
+		 * list alone entirely rather than trust either link.
+		 *
+		 * ml623: this used to publish 0, which ORPHANS the whole remainder of the
+		 * available list for the size class (head->next…tail became unreachable,
+		 * and the next page_available_to_free() on one of those orphans hits the
+		 * else-branch with a stale prev — the ml614 shape). Advance the head to
+		 * page->next instead, and only refuse the link if it is implausible. */
+		if (page->size_class < SIZE_CLASS_COUNT && heap->page_available[page->size_class] == page) {
+			page_t* next = page->next;
+			if (next && (((uintptr_t)next & 0xfULL) != 0 || next == page))
+				next = 0;
+			heap->page_available[page->size_class] = next;
+			if (next)
+				next->prev = 0;
+		}
 	} else if (heap->page_available[page->size_class] == page) {
 		heap->page_available[page->size_class] = page->next;
+		/* ml623: the new head must have no prev — see page_full_to_available(). */
+		if (page->next)
+			page->next->prev = 0;
 	} else {
 		page->prev->next = page->next;
 		if (page->next)
 			page->next->prev = page->prev;
 	}
+	page->prev = 0; /* ml623: a page off the available list carries no stale prev */
 	page->is_free = 1;
 	page->is_zero = 0;
 	page->next = heap->page_free[page->page_type];
@@ -1944,6 +1993,13 @@ page_full_to_available(page_t* page) {
 	rpmalloc_assert(page->is_decommitted == 0, "Page decommitted flag internal failure");
 	heap_t* heap = page->heap;
 	page->next = heap->page_available[page->size_class];
+	/* ml623: the page is being published as the HEAD, so its prev must be NULL.
+	 * This used to keep whatever prev the page carried from its previous stint in
+	 * the list (available_to_full does not clear it), which made
+	 * "head with a non-NULL prev" a normal state — the bad=0x20 false positive
+	 * the ml607 trap kept reporting, and which drove page_available_to_free()
+	 * into its "corrupt" branch on a perfectly healthy list. */
+	page->prev = 0;
 	if (page->next)
 		page->next->prev = page;
 	heap->page_available[page->size_class] = page;
@@ -1970,13 +2026,31 @@ page_full_to_free_on_new_heap(page_t* page, heap_t* heap) {
 static void
 page_available_to_full(page_t* page) {
 	heap_t* heap = page->heap;
-	if (heap->page_available[page->size_class] == page) {
+	unsigned bad = rpm_avail_check(page->heap, page->size_class, page, /*is_head=*/0, "to_full");
+	if (UNEXPECTED(bad != 0)) {
+		/* ml623: same policy as page_available_to_free() — never write through a
+		 * link the trap has already rejected. Advance the head past this page if
+		 * it genuinely is the head, otherwise leave the list untouched. */
+		if (page->size_class < SIZE_CLASS_COUNT && heap->page_available[page->size_class] == page) {
+			page_t* next = page->next;
+			if (next && (((uintptr_t)next & 0xfULL) != 0 || next == page))
+				next = 0;
+			heap->page_available[page->size_class] = next;
+			if (next)
+				next->prev = 0;
+		}
+	} else if (heap->page_available[page->size_class] == page) {
 		heap->page_available[page->size_class] = page->next;
+		/* ml623: the new head must have no prev. */
+		if (page->next)
+			page->next->prev = 0;
 	} else {
 		page->prev->next = page->next;
 		if (page->next)
 			page->next->prev = page->prev;
 	}
+	page->prev = 0; /* ml623: off the available list => no stale prev */
+	page->next = 0;
 	page->is_full = 1;
 	page->is_zero = 0;
 	page->generic_free = 1;
