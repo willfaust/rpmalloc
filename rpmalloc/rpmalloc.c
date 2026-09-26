@@ -970,8 +970,13 @@ ios_fex_band_select(ios_valloc2_t valloc2) {
 		{0x0c00000000ULL, 0x0dffffffffULL},
 	};
 	SYSTEM_INFO si;
-	char buf[224];
+	/* ml787: was char[224] and the NO BAND verdict below ALREADY overflowed it by
+	 * one byte (87 bytes of ml706 text + 138 of ml755 = 225 written into 224), on
+	 * the one path that runs when everything has gone wrong. The two strings are
+	 * appended into the same buffer before a single emit, so size for the pair. */
+	char buf[512];
 	int i, c;
+
 
 	memset(&si, 0, sizeof(si));
 	GetSystemInfo(&si);
@@ -1164,9 +1169,15 @@ ios_fex_band_select(ios_valloc2_t valloc2) {
 		 * that wreckage. On the research VM this happens whenever the kernel's
 		 * randomised VA partitions leave no usable window: one launch had EVERY
 		 * 4GB window from 32-63GB refuse even a 16KB reservation. */
+		/* ml787: message made GUEST-WIDTH AGNOSTIC. This selector is linked into
+		 * both CPU modules -- the ARM64EC one (64-bit guests) and the WoW64 one
+		 * (32-bit guests) -- and the 32-bit bring-up hit it first, where "x64
+		 * cannot start" reads as "this cannot be my failure". The arena is host
+		 * memory; no guest of any width can run without it. */
 		i = ios_va_cat(buf, i,
-		               "[va-profile] ml755 FATAL: no FEX arena -- x64 cannot start. "
-		               "Expect a null-pointer store at +0x7f0 next; that is a SYMPTOM, not the cause.\n");
+		               "[va-profile] ml755 FATAL: no FEX host arena -- the emulator cannot start "
+		               "(any guest width). Expect a null-pointer store through the first NULL host "
+		               "allocation next; that is a SYMPTOM, not the cause.\n");
 	}
 	ios_va_emit(buf, i);
 }
