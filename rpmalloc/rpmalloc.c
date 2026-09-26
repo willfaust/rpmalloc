@@ -959,7 +959,12 @@ ios_va_hex(char* buf, int i, uintptr_t v) {
 
 static void
 ios_fex_band_select(ios_valloc2_t valloc2) {
-	static const uintptr_t cand[][2] = {
+	/* MADEIRA ml1600/ml1630: cand[1] is [48 GB, 60 GB), was 8 GB: the 64 GB regime's slice ran dry
+	 * under a launcher's browser helper (tablet log 207: new-thread allocations at 0xdf6xxxxxx,
+	 * then FEX wrote through a failed one at 0x1000). A placement range, not a reservation,
+	 * still below that map's end (63 GB). No runtime switch: this selector runs before the
+	 * ARM64EC TEB exists, where GetEnvironmentVariableA faults (upstream ml797 note). */
+	static uintptr_t cand[][2] = {
 		/* 512GB regime (iOS 27): the established layout. Must stay clear of
 		 * CEF's four 16GB PartitionAlloc pools at [0x74,0x7c) -- see the ml325
 		 * correction in AllocatorHooks.h. */
@@ -967,7 +972,7 @@ ios_fex_band_select(ios_valloc2_t valloc2) {
 		/* Constrained 64GB regime (iOS 26.x): a host-only slice at 48-56GB,
 		 * inside the low free hole and below the GPU carveout at [64G,448G).
 		 * Sized for simple guests; CEF's pools need separate placement work. */
-		{0x0c00000000ULL, 0x0dffffffffULL},
+		{0x0c00000000ULL, 0x0effffffffULL},
 	};
 	SYSTEM_INFO si;
 	/* ml787: was char[224] and the NO BAND verdict below ALREADY overflowed it by
