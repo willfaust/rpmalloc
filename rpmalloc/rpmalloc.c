@@ -888,6 +888,21 @@ char ios_va_log[4096];
 int ios_va_log_len = 0;
 uintptr_t ios_fex_band_end = 0;
 
+/* MADEIRA: the dual-mapped JIT pool's RX range, [rx, end).
+ *
+ * Nothing here selects or allocates it -- the pool is created by the app before Wine starts and
+ * published through WINE_IOS_JIT_RX / WINE_IOS_JIT_SIZE. The CPU module (ARM64EC/Module.cpp,
+ * WOW64/Module.cpp) fills these in at process init, next to FEXCore::DualMap::WriteOffset, and
+ * FEXCore::Allocator::VirtualAlloc uses them to REFUSE an executable allocation that did not come
+ * from the pool: every JIT write goes to `address + WriteOffset`, which is only mapped for pool
+ * addresses, so a non-pool code buffer writes into unmapped memory on its first emit.
+ *
+ * They live here, beside ios_fex_band_base, purely so that every FEX binary that links FEXCore has
+ * a definition without each one needing its own. Zero means "not published yet" and disables the
+ * check rather than failing allocations. */
+uintptr_t ios_fex_jit_pool_rx = 0;
+uintptr_t ios_fex_jit_pool_end = 0;
+
 typedef PVOID(WINAPI* ios_valloc2_t)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, MEM_EXTENDED_PARAMETER*, ULONG);
 
 static void
