@@ -1922,6 +1922,26 @@ rpm_avail_check(heap_t* heap, size_t size_class, page_t* page, int is_head, cons
 	return bad;
 }
 
+/* The one thing a caller may do with a page the trap has rejected: take it off
+ * the list WITHOUT reading or writing through either of its links. Once the trap
+ * has fired, page->next and page->prev are unverified pointers, and a store
+ * through one of them is exactly the wild write the trap exists to prevent.
+ *
+ * If the page genuinely is the head, the size class's available list is dropped
+ * (published as 0), as upstream's ml615 guard does: the rest of that list is
+ * quarantined -- no longer reachable from the heap, never walked again from the
+ * head, its pages leaked rather than trusted. Otherwise the list is left exactly
+ * as it is. The page's own links are cleared by the caller.
+ *
+ * (An earlier revision advanced the head to page->next and cleared next->prev to
+ * keep the remainder reachable. That wrote through the link the trap had just
+ * rejected, so it is gone: a leaked list is recoverable, a wild store is not.) */
+static void
+rpm_avail_quarantine(heap_t* heap, page_t* page) {
+	if (page->size_class < SIZE_CLASS_COUNT && heap->page_available[page->size_class] == page)
+		heap->page_available[page->size_class] = 0;
+}
+
 static void
 page_available_to_free(page_t* page) {
 	/* ml615: TRAP BEFORE MUTATION. ml614 checked, ignored the answer, and then
@@ -1957,22 +1977,7 @@ page_available_to_free(page_t* page) {
 	rpmalloc_assert(page->is_decommitted == 0, "Page decommitted flag internal failure");
 	heap_t* heap = page->heap;
 	if (bad) {
-		/* Only detach the head if this page genuinely is it; otherwise leave the
-		 * list alone entirely rather than trust either link.
-		 *
-		 * ml623: this used to publish 0, which ORPHANS the whole remainder of the
-		 * available list for the size class (head->next…tail became unreachable,
-		 * and the next page_available_to_free() on one of those orphans hits the
-		 * else-branch with a stale prev — the ml614 shape). Advance the head to
-		 * page->next instead, and only refuse the link if it is implausible. */
-		if (page->size_class < SIZE_CLASS_COUNT && heap->page_available[page->size_class] == page) {
-			page_t* next = page->next;
-			if (next && (((uintptr_t)next & 0xfULL) != 0 || next == page))
-				next = 0;
-			heap->page_available[page->size_class] = next;
-			if (next)
-				next->prev = 0;
-		}
+		rpm_avail_quarantine(heap, page);
 	} else if (heap->page_available[page->size_class] == page) {
 		heap->page_available[page->size_class] = page->next;
 		/* ml623: the new head must have no prev — see page_full_to_available(). */
@@ -2033,17 +2038,8 @@ page_available_to_full(page_t* page) {
 	heap_t* heap = page->heap;
 	unsigned bad = rpm_avail_check(page->heap, page->size_class, page, /*is_head=*/0, "to_full");
 	if (UNEXPECTED(bad != 0)) {
-		/* ml623: same policy as page_available_to_free() — never write through a
-		 * link the trap has already rejected. Advance the head past this page if
-		 * it genuinely is the head, otherwise leave the list untouched. */
-		if (page->size_class < SIZE_CLASS_COUNT && heap->page_available[page->size_class] == page) {
-			page_t* next = page->next;
-			if (next && (((uintptr_t)next & 0xfULL) != 0 || next == page))
-				next = 0;
-			heap->page_available[page->size_class] = next;
-			if (next)
-				next->prev = 0;
-		}
+		/* ml623: same policy as page_available_to_free(). */
+		rpm_avail_quarantine(heap, page);
 	} else if (heap->page_available[page->size_class] == page) {
 		heap->page_available[page->size_class] = page->next;
 		/* ml623: the new head must have no prev. */
