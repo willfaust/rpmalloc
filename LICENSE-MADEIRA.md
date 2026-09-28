@@ -77,3 +77,13 @@ combination, but need not include the source code of those Apple libraries.
 This permission does not extend to those libraries, which remain subject to
 Apple's own licence terms. You may remove this additional permission from
 copies you convey, as GPL-3.0 section 7 allows.
+
+## Third-party contributions
+
+Contributed under `CONTRIBUTING.md` (GPL-3.0-or-later with the Madeira
+Converter Exception) and signed off under the DCO; copyright stays with the
+author.
+
+- **125hz**, merged 2026-09-29 from pull request #1 (JIT-pool range,
+  available-list invariant, 64 GB-regime arena): `137dc41`, `ed36f12`,
+  `d8cf809`, `2aa52c0`, `167eba0`, `812c2b9`.
