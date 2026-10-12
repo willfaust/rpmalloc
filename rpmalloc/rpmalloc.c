@@ -166,13 +166,29 @@ madvise(caddr_t, size_t, int);
 
 #define SMALL_GRANULARITY 16
 
+/* madeira-bcd: the ARM64EC module (64-bit processes) uses coherent 4 MiB spans: span size and
+ * alignment, large page size and the large size-class ceiling change together. The WOW64 module
+ * and every other build keep their geometry. */
+#if defined(FEX_IOS_HOST) && (defined(__arm64ec__) || defined(_M_ARM64EC))
+#define RPMALLOC_IOS_SPAN4 1
+#endif
+
 #define SMALL_BLOCK_SIZE_LIMIT (4 * 1024)
 #define MEDIUM_BLOCK_SIZE_LIMIT (256 * 1024)
+#ifdef RPMALLOC_IOS_SPAN4
+/* madeira-bcd: the largest class that fits beside a 4 MiB page's header. */
+#define LARGE_BLOCK_SIZE_LIMIT (7 * 512 * 1024)
+#else
 #define LARGE_BLOCK_SIZE_LIMIT (8 * 1024 * 1024)
+#endif
 
 #define SMALL_SIZE_CLASS_COUNT 73
 #define MEDIUM_SIZE_CLASS_COUNT 24
+#ifdef RPMALLOC_IOS_SPAN4
+#define LARGE_SIZE_CLASS_COUNT 15
+#else
 #define LARGE_SIZE_CLASS_COUNT 20
+#endif
 #define SIZE_CLASS_COUNT (SMALL_SIZE_CLASS_COUNT + MEDIUM_SIZE_CLASS_COUNT + LARGE_SIZE_CLASS_COUNT)
 
 #define SMALL_PAGE_SIZE_SHIFT 16
@@ -186,7 +202,12 @@ madvise(caddr_t, size_t, int);
  * SPAN_SIZE note below). Large-class ceiling falls 64MB -> 16MB; blocks in
  * (16MB, 64MB] shift to the huge path, which maps them at exact size — a VA
  * IMPROVEMENT over carving them from a 64MB span. */
+#ifdef RPMALLOC_IOS_SPAN4
+/* madeira-bcd: paired with the 4 MiB span and its 3.5 MiB class ceiling. */
+#define LARGE_PAGE_SIZE_SHIFT 22
+#else
 #define LARGE_PAGE_SIZE_SHIFT 24
+#endif
 #else
 #define LARGE_PAGE_SIZE_SHIFT 26
 #endif
@@ -214,8 +235,17 @@ madvise(caddr_t, size_t, int);
  * the per-thread span footprint 4x (~48MB worst case); with the ml389 VA diet and
  * db 5392 exact-aligned maps this puts 74 threads at ~3.5GB. Exit-leak (12 heaps,
  * ~2GB) is secondary and partially covered by the ml435 ThreadTerm hardening. */
+#ifdef RPMALLOC_IOS_SPAN4
+/* madeira-bcd: coherent 4 MiB spans: reduce both reservation size and alignment.
+ * Keeping a 16 MiB mask/alignment with smaller reservations still
+ * exhausts aligned slots. All page/header lookup masks derive below;
+ * live-span ownership and the protected FEX band are unchanged. */
+static const char ios_span4_marker[] __attribute__((used)) = "rpmalloc-span4 madeira-bcd";
+#define SPAN_SIZE (4 * 1024 * 1024)
+#else
 static const char ios_span16_marker[] __attribute__((used)) = "rpmalloc-span16 rev=ml436";
 #define SPAN_SIZE (16 * 1024 * 1024)
+#endif
 #else
 #define SPAN_SIZE (256 * 1024 * 1024)
 #endif
@@ -613,8 +643,11 @@ static const size_class_t global_size_class[SIZE_CLASS_COUNT] = {
     MCLASS(2048),   MCLASS(2560),   MCLASS(3072),   MCLASS(3584),   MCLASS(4096),   MCLASS(5120),   MCLASS(6144),
     MCLASS(7168),   MCLASS(8192),   MCLASS(10240),  MCLASS(12288),  MCLASS(14336),  MCLASS(16384),  LCLASS(20480),
     LCLASS(24576),  LCLASS(28672),  LCLASS(32768),  LCLASS(40960),  LCLASS(49152),  LCLASS(57344),  LCLASS(65536),
-    LCLASS(81920),  LCLASS(98304),  LCLASS(114688), LCLASS(131072), LCLASS(163840), LCLASS(196608), LCLASS(229376),
-    LCLASS(262144), LCLASS(327680), LCLASS(393216), LCLASS(458752), LCLASS(524288)};
+    LCLASS(81920),  LCLASS(98304),  LCLASS(114688), LCLASS(131072), LCLASS(163840), LCLASS(196608), LCLASS(229376)
+#ifndef RPMALLOC_IOS_SPAN4
+    , LCLASS(262144), LCLASS(327680), LCLASS(393216), LCLASS(458752), LCLASS(524288)
+#endif
+};
 
 //! Threshold number of pages for when free pages are decommitted
 static uint32_t global_page_free_overflow[4] = {0, 0, 0, 0};
